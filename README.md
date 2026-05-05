@@ -1,166 +1,55 @@
-# Tiny Instagram (minimal) on Google App Engine
+# TinyInsta — Est-ce que ça scale ?
 
-This repository contains a tiny Instagram-like demo implemented with Flask and Google Cloud Datastore (Firestore in Datastore mode). It is a small, educational project that demonstrates posting, following, and reading a simple timeline.
+TP de passage à l'échelle sur [TinyInsta](https://github.com/momo54/massive-gcp), une mini app type Instagram déployée sur Google App Engine avec Datastore.
 
-This README describes how to run, seed and test the app, plus notes about GQL queries and common deployment troubleshooting.
+**URL de l'app** : https://tinyinsta-gcp.ew.r.appspot.com
 
-## Prerequisites
-- Create a GCP Project:`https://console.cloud.google.com/`
-  - See the prof.
+## Expérience 1 — On augmente le nombre d'utilisateurs simultanés
 
-- Open a cloud shell 
-  - see the prof.
+On fixe les données (1000 users, 50 posts/user, 20 followers chacun) et on fait varier le nombre de personnes qui utilisent l'app en même temps : 1, 10, 20, 50, 100 et 1000.
 
-* Initialize or select your GCP project and create the App Engine application (if not already created):
+Pour chaque config, on lance 3 runs de 60 secondes avec Locust et on mesure le temps moyen pour charger une timeline.
 
-```sh
-gcloud init
-gcloud app create
-```
+![Concurrence](out/conc.png)
 
-- clone the prof github repository : 
-```
-git clone https://github.com/momo54/massive-gcp
-cd massive-gcp
-```
+## Expérience 2 — On augmente le nombre de followees
 
-* Install dependencies
-```sh
-pip install -r requirements.txt
-```
+Cette fois on fixe 50 utilisateurs simultanés et 100 posts/user, et on fait varier le nombre de personnes que chaque user suit : 20, 40 puis 60.
 
-* Deploy the app:
+![Fanout](out/fanout.png)
 
-```sh
-gcloud app deploy
-```
+## Ce qu'on observe
 
-* [OPTIONAL] Index does not matter:
+### Concurrence
 
-```sh
-gcloud app deploy index.yaml
-# or
-gcloud datastore indexes create index.yaml
-```
+Jusqu'à 20 users simultanés, ça tourne bien (~30-40ms par requête). À 50 ça commence à ralentir un peu, et à 1000 le temps de réponse monte à plus d'une seconde.
 
-* open the URL address of the you application, create account, post, follow. Does it Works?? If something is wrong where to find the error ?? 
-  * See the prof
+C'est logique car quand il y a beaucoup de monde d'un coup, App Engine doit lancer de nouvelles instances, et le datastore a un peu de mal parce que chaque requête de timeline génère 20 sous-requêtes (une par followee) qui sont fusionnées côté serveur.
 
+Par contre l'app ne plante pas elle répond juste plus lentement.
 
-* How many servers are working for this app?? How much are you paying for running this app ? What is the cloud model for this app (Iaas, Paas, Saas). What is the Platform in PaaS ??
+### Fanout
 
-* See the impact in the datastore: do you see your data ?
-  * See the prof
+Plus un user suit de monde, plus la timeline est longue à charger. On passe de ~0.11s pour 20 followees, à ~2.14s pour 40, et ~2.93s pour 60.
 
-* How much are you paying for hosting these data in this store ?? 
-* What is the consistency of this store ?
-* What is the sharding strategy of this store ? How to be sure of that ? 
-* What queries can you write with store (expressivity)
+C'est logique car la clause `IN` de lance une sous-requête par followee puis fusionne les résultats. Suivre 60 personnes = 3x plus de sous-requêtes que 20, et le temps de réponse explose en conséquence. La croissance est exponentielle, ce qui montre bien que cette approche ne scale pas du tout sur le fanout.
 
-## HTTP Endpoints
+### Du coup, ça scale ou pas ?
 
-- `/` — HTML UI for simple interactions
-- `POST /login` — login with a username (no password)
-- `POST /post` — create a new post (form)
-- `POST /follow` — follow another user (form)
-- `GET /api/timeline?user=<username>&limit=<n>` — JSON timeline for a user (default limit 20)
-- `POST /admin/seed` — server-side seed (requires `SEED_TOKEN` via header `X-Seed-Token` or `token` param)
+Ça scale **en partie**. App Engine ajoute bien des instances quand la charge monte, donc l'app ne tombe jamais. Mais la façon dont la timeline est calculée (lecture à la volée avec une requête `IN`) est un vrai goulot d'étranglement.
 
-Example server-side seed call:
+Pour que ça scale mieux, il faudrait par exemple :
+- Pré-calculer les timelines à chaque nouveau post 
+- Mettre du cache sur les timelines les plus demandées
+- Mieux paginer les résultats
 
-```sh
-curl -X POST \
-  -H "X-Seed-Token: change-me-seed-token" \
-  "https://<YOUR_APP>.appspot.com/admin/seed?users=8&posts=100&follows_min=1&follows_max=4&prefix=load"
-```
-
-## Access the backend from the CLI
-
-The JSON endpoint `GET /api/timeline?user=<username>&limit=20` is suitable for basic load experiments.
-
-- Run locally against the dev server:
-
-```sh
-ab -n 200 -c 20 "http://127.0.0.1:8080/api/timeline?user=demo1&limit=20"
-```
-
-- Run against the deployed app (no cookie):
-
-```sh
-ab -n 500 -c 50 "https://<YOUR_APP>.appspot.com/api/timeline?user=demo1&limit=20"
-```
-
-- Optional: include a session cookie if you want to test authenticated flows (get `session` cookie from your browser devtools):
-
-```sh
-AB_COOKIE="session=<VALUE>"
-ab -n 500 -c 50 -H "Cookie: $AB_COOKIE" "https://<YOUR_APP>.appspot.com/api/timeline?limit=20"
-```
-
-Interpreting common metrics:
-- `Requests per second` — throughput
-- `Time per request` — latency
-- `Failed requests` — should remain near 0 for a healthy run
-
-## GQL & Datastore notes
-
-The timeline query used by the app is roughly:
-
-```sql
-SELECT * FROM Post WHERE author IN @authors ORDER BY created DESC
-```
-
-Notes:
-- `IN` queries are conceptually implemented as a union of per-author scans followed by a k-way merge ordered by `created DESC`.
-- The repository includes `index.yaml` with a composite index (author + created desc), which is required for efficient execution of the timeline query.
-- Writes use the Datastore entity API; GQL is used for convenient reads only.
-
-Limitations and trade-offs:
-- `IN` with many values increases work and latency because it becomes multiple queries merged server-side.
-- Global queries are eventually consistent; only key lookups and ancestor queries are strongly consistent. See `NOTES.md` for more detail.
-
-## Troubleshooting: Cloud Build / staging bucket error
-
-If you encounter an error like:
+Certaines erreurs ont pu être observées (ex: C onnectionRefused, DNS) peuvent provenir de l’environnement de test et non uniquement de l’application.
+## Structure du repo
 
 ```
-Failed to create cloud build: ... invalid bucket "staging.<PROJECT>.appspot.com"; service account ... does not have access
-```
-
-Check the following:
-
-1. Required services are enabled:
-
-```sh
-gcloud services enable appengine.googleapis.com cloudbuild.googleapis.com iam.googleapis.com storage.googleapis.com
-```
-
-2. Ensure the App Engine service account has sufficient permissions on the staging bucket. For example, grant storage admin at project level (adjust to least privilege required):
-
-```sh
-PROJECT_ID="<YOUR_PROJECT>"
-gcloud projects add-iam-policy-binding "$PROJECT_ID" \
-  --member="serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com" \
-  --role="roles/storage.admin"
-```
-
-3. If the staging bucket is missing, create it and grant the service account object admin on the bucket:
-
-```sh
-gsutil mb -p "$PROJECT_ID" -l europe-west1 "gs://staging.${PROJECT_ID}.appspot.com"
-gsutil iam ch serviceAccount:${PROJECT_ID}@appspot.gserviceaccount.com:objectAdmin "gs://staging.${PROJECT_ID}.appspot.com"
-```
-
-Index deployment (if GCP prompts for missing indexes):
-
-```sh
-gcloud datastore indexes create index.yaml || gcloud app deploy index.yaml
-```
-
-## Notes on consistency, partitioning and CAP
-See `NOTES.md` for a concise explanation of Datastore's partitioning (range partitioning with dynamic splits), replication, and its consistency model (generally AP for global queries; strong consistency for key lookups and ancestor queries).
-
-## License
-MIT
-
+out/
+├── conc.csv       # Résultats expérience 1
+├── conc.png       # Graphique expérience 1
+├── fanout.csv     # Résultats expérience 2
+└── fanout.png     # Graphique expérience 2
 ```
